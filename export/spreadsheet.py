@@ -4,6 +4,7 @@ Supports filtering, chunked export for large datasets, and formatted headers.
 """
 
 import os
+import glob
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -14,6 +15,28 @@ from db.mongo_client import mongo
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _cleanup_old_exports(label: str):
+    """Remove old export files for the same filter label to avoid duplicates."""
+    # Match both exact (schools_label.xlsx) and legacy timestamped (schools_label_*.xlsx)
+    patterns = [
+        os.path.join(EXPORT_DIR, f"schools_{label}.xlsx"),
+        os.path.join(EXPORT_DIR, f"schools_{label}_*.xlsx"),
+        os.path.join(EXPORT_DIR, f"schools_{label}_part*.xlsx"),
+    ]
+    removed = 0
+    for pattern in patterns:
+        for old_file in glob.glob(pattern):
+            try:
+                os.remove(old_file)
+                logger.info("Removed old export: %s", os.path.basename(old_file))
+                removed += 1
+            except OSError as e:
+                logger.warning("Could not remove %s: %s", old_file, e)
+    if removed:
+        logger.info("Cleaned up %d old export file(s).", removed)
+
 
 # Column definitions: (header_name, mongo_field, column_width)
 COLUMNS = [
@@ -116,11 +139,13 @@ def export_to_excel(
         logger.warning("No schools to export.")
         return None
 
-    # Generate filename
+    # Generate deterministic filename (no timestamp → overwrites previous export)
+    label = province_name.replace(" ", "_").replace(".", "").lower() if province_name else "all"
     if not output_path:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        label = province_name.replace(" ", "_").lower() if province_name else "all"
-        output_path = os.path.join(EXPORT_DIR, f"schools_{label}_{timestamp}.xlsx")
+        output_path = os.path.join(EXPORT_DIR, f"schools_{label}.xlsx")
+
+    # Clean up old export files matching this filter to avoid duplicates
+    _cleanup_old_exports(label)
 
     # Check if we need chunked export
     if total > MAX_ROWS_PER_FILE:

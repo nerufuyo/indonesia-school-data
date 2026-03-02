@@ -21,6 +21,20 @@ logger = get_logger(__name__)
 TASK_NAME = "kemendikdasmen_scrape"
 
 
+def _deduplicate_batch(schools: list[dict]) -> list[dict]:
+    """Remove duplicate schools within a batch by NPSN."""
+    seen = set()
+    unique = []
+    for school in schools:
+        npsn = school.get("npsn")
+        if npsn and npsn not in seen:
+            seen.add(npsn)
+            unique.append(school)
+    if len(unique) < len(schools):
+        logger.info("Deduplicated batch: %d → %d records", len(schools), len(unique))
+    return unique
+
+
 @retry(
     stop=stop_after_attempt(MAX_RETRIES),
     wait=wait_exponential(multiplier=2, min=2, max=30),
@@ -124,7 +138,7 @@ def scrape_schools(
             return
 
         # Process first page
-        schools = first_page.get("data", [])
+        schools = _deduplicate_batch(first_page.get("data", []))
         if schools:
             count = mongo.upsert_schools_batch(schools)
             mongo.save_progress(progress_key, {
@@ -145,7 +159,7 @@ def scrape_schools(
         while offset < total:
             try:
                 page_data = _fetch_page(client, offset, batch_size, filters)
-                schools = page_data.get("data", [])
+                schools = _deduplicate_batch(page_data.get("data", []))
 
                 if not schools:
                     logger.info("No more data at offset %d. Done.", offset)

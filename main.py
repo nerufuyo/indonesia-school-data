@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 
 from config import PROVINCES, EDUCATION_TYPES, STATUS_OPTIONS, BATCH_SIZE, GOOGLE_SEARCH_DELAY
@@ -84,9 +85,17 @@ def cmd_export(args):
 
         # Upload to R2 unless --no-upload
         if not args.no_upload:
+            from config import R2_EXPORT_PREFIX
+
             logger.info("Uploading to Cloudflare R2 (bucket: geniusai)...")
             for f in files:
-                url = r2_storage.upload_file(f)
+                filename = os.path.basename(f)
+                r2_key = f"{R2_EXPORT_PREFIX}/{filename}"
+
+                # Delete old version in R2 first to avoid duplicates
+                r2_storage.delete_file(r2_key)
+
+                url = r2_storage.upload_file(f, r2_key=r2_key)
                 if url:
                     logger.info("  ☁ Uploaded: %s", url)
 
