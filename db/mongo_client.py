@@ -81,6 +81,18 @@ class MongoDB:
             logger.warning("Bulk write had errors: %s", e.details.get("writeErrors", []))
             return e.details.get("nInserted", 0)
 
+    def update_school(self, npsn: str, data: dict) -> bool:
+        """Update a single school record by NPSN."""
+        try:
+            self.db[COL_SCHOOLS].update_one(
+                {"npsn": npsn},
+                {"$set": data},
+            )
+            return True
+        except Exception as e:
+            logger.error("Failed to update school %s: %s", npsn, e)
+            return False
+
     def get_school_count(self, query: dict | None = None) -> int:
         """Get the count of schools matching a query."""
         return self.db[COL_SCHOOLS].count_documents(query or {})
@@ -172,8 +184,9 @@ class MongoDB:
             {"$addFields": {
                 "instagram": "$enrichment.instagram",
                 "whatsapp": "$enrichment.whatsapp",
-                "website": "$enrichment.website",
-                "contact_number": "$enrichment.contact_number",
+                "facebook": "$enrichment.facebook",
+                "website_social": "$enrichment.website",
+                "contact_social": "$enrichment.contact_number",
             }},
             {"$project": {"enrichment": 0, "_id": 0}},
         ])
@@ -212,8 +225,10 @@ class MongoDB:
         """Return a summary of the current database state."""
         return {
             "total_schools": self.get_school_count(),
+            "total_with_details": self.db[COL_SCHOOLS].count_documents({"detail_fetched": True}),
             "total_enriched": self.get_enriched_count(),
             "scrape_progress": self.get_progress("kemendikdasmen_scrape"),
+            "detail_progress": self.get_progress("kemendikdasmen_detail"),
             "enrich_progress": self.get_progress("google_enrich"),
         }
 

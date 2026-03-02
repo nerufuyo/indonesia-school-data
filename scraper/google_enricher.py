@@ -1,7 +1,12 @@
 """
-Phase 2: Enrich school data with contact info from Google Search + DeepSeek.
-Searches Google for each school, scrapes top results, and uses DeepSeek AI
-to extract Instagram, WhatsApp, Website, and Contact Number.
+Phase 2: Advanced social media & contact enrichment.
+
+Strategy:
+1. First check data already obtained from the Kemendikdasmen detail API (phone, email, website).
+2. Run multiple targeted Google searches with different query strategies.
+3. Use regex to extract from raw HTML before parsing.
+4. Send combined data to DeepSeek for structured extraction.
+5. Merge all sources intelligently (govt data > DeepSeek > regex).
 """
 
 import re
@@ -21,116 +26,275 @@ logger = get_logger(__name__)
 
 TASK_NAME = "google_enrich"
 
-# Regex patterns for quick extraction from raw HTML/text
+# ── Regex Patterns ────────────────────────────────────────────────────────────
+
+# Indonesian phone numbers: +62xxx, 08xxx, 021-xxx, (021) xxx
 PHONE_PATTERN = re.compile(
-    r"(?:\+62|062|0)[\s\-]?\d{2,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}"
+    r"(?:\+62|062|0)[\s\-.]?\d{2,4}[\s\-.]?\d{3,4}[\s\-.]?\d{2,5}"
 )
+
+# Instagram: full URL or @handle or "ig: handle"
 INSTAGRAM_PATTERN = re.compile(
-    r"(?:instagram\.com|ig[:\s]*@?|instagram[:\s]*@?)\s*([\w.]+)", re.IGNORECASE
+    r"(?:instagram\.com/|ig[:\s]+@?|instagram[:\s]+@?|@)([\w][\w.]{1,28}[\w])",
+    re.IGNORECASE,
 )
+
+# WhatsApp: wa.me link or "wa: number" or "whatsapp: number"
 WHATSAPP_PATTERN = re.compile(
-    r"(?:wa\.me/|whatsapp[:\s]*\+?|wa[:\s]*\+?)([\d\s\-+]+)", re.IGNORECASE
+    r"(?:wa\.me/|api\.whatsapp\.com/send\?phone=|whatsapp[:\s]*\+?|wa[:\s]*\+?|hubungi\s*(?:wa|whatsapp)[:\s]*\+?)([\d\s\-+]{8,20})",
+    re.IGNORECASE,
 )
+
+# Facebook: full URL
+FACEBOOK_PATTERN = re.compile(
+    r"(?:facebook\.com/|fb\.com/)([\w.\-]+)",
+    re.IGNORECASE,
+)
+
+# Website: any URL that's not a big social platform
 WEBSITE_PATTERN = re.compile(
-    r"https?://(?:www\.)?(?!(?:google|facebook|instagram|twitter|youtube|wa\.me|maps\.google))"
+    r"https?://(?:www\.)?(?!(?:google|facebook|instagram|twitter|youtube|wa\.me|maps\.google|tiktok|linkedin|play\.google))"
     r"[a-zA-Z0-9\-]+\.[a-zA-Z]{2,}[^\s\"'<>]*",
     re.IGNORECASE,
 )
 
+# Look for email addresses
+EMAIL_PATTERN = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+    re.IGNORECASE,
+)
+
+
+# ── Web Scraping ──────────────────────────────────────────────────────────────
 
 @retry(
     stop=stop_after_attempt(2),
     wait=wait_exponential(multiplier=1, min=1, max=10),
     retry=retry_if_exception_type((httpx.ConnectError, httpx.ReadTimeout)),
 )
-def _scrape_page(url: str) -> str:
-    """Scrape a web page and return cleaned text content."""
+def _scrape_page(url: str) -> tuple[str, str]:
+    """
+    Scrape a page. Returns (raw_html, cleaned_text).
+    We keep raw HTML for regex extraction (social links are often in HTML only).
+    """
     try:
         with httpx.Client(
             follow_redirects=True,
-            timeout=15,
+            timeout=12,
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
+                    "Chrome/125.0.0.0 Safari/537.36"
                 ),
+                "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
             },
         ) as client:
             resp = client.get(url)
             resp.raise_for_status()
 
+            raw_html = resp.text[:15000]  # Keep more HTML for regex matching
+
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Remove scripts and styles
-            for tag in soup(["script", "style", "nav", "footer", "header"]):
+            # Remove noise
+            for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
                 tag.decompose()
 
             text = soup.get_text(separator=" ", strip=True)
-
-            # Truncate to avoid sending too much to DeepSeek
-            return text[:5000]
+            return raw_html, text[:6000]
 
     except Exception as e:
         logger.debug("Failed to scrape %s: %s", url, e)
-        return ""
+        return "", ""
 
 
-def _google_search_school(school_name: str, location: str) -> list[dict]:
+# ── Search Strategies ─────────────────────────────────────────────────────────
+
+def _build_search_queries(name: str, location: str, npsn: str) -> list[str]:
     """
-    Search Google for a school and return results.
-    Returns list of dicts with 'url' and 'snippet'.
+    Build multiple targeted search queries for different aspects.
+    Returns a list of query strings to try.
     """
-    query = f'"{school_name}" {location} kontak instagram whatsapp'
+    clean_name = name.strip()
 
-    results = []
-    try:
-        for url in google_search(query, num_results=5, lang="id"):
-            results.append({"url": url, "snippet": ""})
-    except Exception as e:
-        logger.warning("Google search failed for '%s': %s", school_name, e)
+    queries = []
 
-    return results
+    # Strategy 1: General search with school name + location
+    queries.append(f'"{clean_name}" {location}')
+
+    # Strategy 2: Instagram specific
+    queries.append(f'"{clean_name}" instagram')
+
+    # Strategy 3: WhatsApp / contact specific
+    queries.append(f'"{clean_name}" whatsapp OR kontak OR hubungi')
+
+    # Strategy 4: Facebook specific (many Indonesian schools use FB)
+    queries.append(f'"{clean_name}" facebook')
+
+    # Strategy 5: Site-specific Instagram search
+    queries.append(f'site:instagram.com "{clean_name}"')
+
+    return queries
 
 
-def _quick_extract_from_text(text: str) -> dict:
+def _google_search_multi(queries: list[str], max_results_per_query: int = 3) -> list[str]:
     """
-    Quick regex-based extraction as a supplement to DeepSeek.
-    Returns partial data that can be merged.
+    Run multiple Google searches and collect unique URLs.
+    Returns deduplicated list of URLs.
+    """
+    seen_urls = set()
+    all_urls = []
+
+    for query in queries:
+        try:
+            for url in google_search(query, num_results=max_results_per_query, lang="id"):
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    all_urls.append(url)
+        except Exception as e:
+            logger.debug("Google search failed for '%s': %s", query[:50], e)
+
+        # Small delay between different searches
+        time.sleep(random.uniform(1.5, 3.0))
+
+    return all_urls
+
+
+# ── Extraction ────────────────────────────────────────────────────────────────
+
+def _extract_from_html_and_text(raw_html: str, text: str) -> dict:
+    """
+    Extract social media handles and contact info from raw HTML + text.
+    HTML is better for finding social links (<a href="instagram.com/...">).
     """
     data = {
         "instagram": None,
         "whatsapp": None,
+        "facebook": None,
         "website": None,
         "contact_number": None,
+        "email": None,
     }
 
-    ig_match = INSTAGRAM_PATTERN.search(text)
-    if ig_match:
-        data["instagram"] = ig_match.group(1).strip()
+    combined = raw_html + "\n" + text
 
-    wa_match = WHATSAPP_PATTERN.search(text)
-    if wa_match:
-        data["whatsapp"] = wa_match.group(1).strip()
+    # Instagram - check HTML first (more reliable links)
+    ig_matches = INSTAGRAM_PATTERN.findall(combined)
+    for handle in ig_matches:
+        handle = handle.strip().lower()
+        # Filter out common false positives
+        if handle not in ("p", "reel", "stories", "explore", "accounts", "about",
+                          "help", "privacy", "terms", "press", "api", "developers",
+                          "share", "direct", "login", "signup"):
+            data["instagram"] = f"@{handle}"
+            break
 
-    phone_match = PHONE_PATTERN.search(text)
-    if phone_match:
-        data["contact_number"] = phone_match.group(0).strip()
+    # WhatsApp
+    wa_matches = WHATSAPP_PATTERN.findall(combined)
+    for num in wa_matches:
+        clean = re.sub(r"[\s\-]", "", num.strip())
+        if len(clean) >= 10:
+            data["whatsapp"] = clean
+            break
 
-    web_match = WEBSITE_PATTERN.search(text)
-    if web_match:
-        data["website"] = web_match.group(0).strip()
+    # Facebook
+    fb_matches = FACEBOOK_PATTERN.findall(combined)
+    for handle in fb_matches:
+        handle = handle.strip()
+        if handle not in ("share", "sharer", "dialog", "plugins", "login",
+                          "l.php", "tr", "watch", "groups", "pages",
+                          "marketplace", "help", "privacy", "policies"):
+            data["facebook"] = f"https://facebook.com/{handle}"
+            break
+
+    # Phone numbers
+    phone_matches = PHONE_PATTERN.findall(combined)
+    for phone in phone_matches:
+        phone = phone.strip()
+        if len(re.sub(r"\D", "", phone)) >= 9:
+            data["contact_number"] = phone
+            break
+
+    # Website
+    web_matches = WEBSITE_PATTERN.findall(combined)
+    for url in web_matches:
+        url = url.strip()
+        # Filter out CDN, analytics, etc.
+        skip_domains = ("cdn.", "ajax.", "analytics.", "fonts.", "static.",
+                        "wp-content", ".js", ".css", ".png", ".jpg", ".gif",
+                        "cloudflare", "googleapis", "gstatic")
+        if not any(d in url.lower() for d in skip_domains):
+            data["website"] = url
+            break
+
+    # Email
+    email_matches = EMAIL_PATTERN.findall(combined)
+    for email in email_matches:
+        if not any(d in email.lower() for d in ("noreply", "example.com", "sentry", "webpack")):
+            data["email"] = email
+            break
 
     return data
 
 
-def _merge_results(deepseek_data: dict, regex_data: dict) -> dict:
-    """Merge DeepSeek and regex results, preferring DeepSeek when available."""
+def _extract_from_urls(urls: list[str]) -> dict:
+    """
+    Analyze the URLs themselves for social media profiles
+    (sometimes the Google result URL IS the school's Instagram/Facebook).
+    """
+    data = {
+        "instagram": None,
+        "facebook": None,
+    }
+
+    for url in urls:
+        url_lower = url.lower()
+
+        if "instagram.com/" in url_lower and not data["instagram"]:
+            match = re.search(r"instagram\.com/([\w.]+)", url)
+            if match:
+                handle = match.group(1)
+                if handle not in ("p", "reel", "explore", "accounts", "stories"):
+                    data["instagram"] = f"@{handle}"
+
+        if ("facebook.com/" in url_lower or "fb.com/" in url_lower) and not data["facebook"]:
+            match = re.search(r"(?:facebook|fb)\.com/([\w.\-]+)", url)
+            if match:
+                handle = match.group(1)
+                if handle not in ("share", "sharer", "dialog", "plugins", "login"):
+                    data["facebook"] = f"https://facebook.com/{handle}"
+
+    return data
+
+
+def _merge_all_results(
+    govt_data: dict,
+    url_data: dict,
+    regex_data: dict,
+    deepseek_data: dict,
+) -> dict:
+    """
+    Merge results from all sources with priority:
+    1. Government detail API (most reliable for phone/email/website)
+    2. URL analysis (if Google returned an Instagram/FB profile directly)
+    3. DeepSeek AI extraction (smart but may hallucinate)
+    4. Regex extraction (fast but may have false positives)
+    """
     merged = {}
-    for key in ["instagram", "whatsapp", "website", "contact_number"]:
-        merged[key] = deepseek_data.get(key) or regex_data.get(key)
+
+    for key in ["instagram", "whatsapp", "facebook", "website", "contact_number", "email"]:
+        merged[key] = (
+            govt_data.get(key)
+            or url_data.get(key)
+            or deepseek_data.get(key)
+            or regex_data.get(key)
+        )
+
     return merged
 
+
+# ── Main Enrichment Loop ──────────────────────────────────────────────────────
 
 def enrich_schools(
     filters: dict | None = None,
@@ -139,20 +303,23 @@ def enrich_schools(
     resume: bool = True,
 ):
     """
-    Main entry point for Phase 2: enrich school data via Google + DeepSeek.
+    Phase 2: Enrich school data with social media and contact info.
 
-    Args:
-        filters: MongoDB query filters for selecting schools to enrich
-        batch_size: Number of schools to process per batch
-        delay: Delay between Google searches (seconds)
-        resume: Whether to skip already-enriched schools
+    Flow per school:
+    1. Check existing govt detail data (phone, email from detail API)
+    2. Google search with 5 different query strategies
+    3. Scrape top results (HTML + text)
+    4. Extract via regex from HTML (catches social links in <a> tags)
+    5. Extract via DeepSeek AI from page text
+    6. Analyze Google result URLs directly (Instagram/FB profile links)
+    7. Merge all sources and save to MongoDB
     """
     batch_size = batch_size or BATCH_SIZE
     delay = delay or GOOGLE_SEARCH_DELAY
     filters = filters or {}
 
     logger.info("=" * 60)
-    logger.info("PHASE 2: Google + DeepSeek Enrichment")
+    logger.info("PHASE 2: Advanced Social Media & Contact Enrichment")
     logger.info("=" * 60)
 
     total_schools = mongo.get_school_count(filters)
@@ -170,9 +337,13 @@ def enrich_schools(
 
     processed = 0
     errors = 0
+    found_ig = 0
+    found_wa = 0
+    found_fb = 0
+    found_web = 0
+    found_phone = 0
 
     while True:
-        # Fetch next batch of unenriched schools
         schools = mongo.get_unenriched_schools(query=filters, limit=batch_size)
 
         if not schools:
@@ -181,8 +352,7 @@ def enrich_schools(
 
         logger.info(
             "Processing batch of %d schools (processed so far: %d)",
-            len(schools),
-            processed,
+            len(schools), processed,
         )
 
         for school in schools:
@@ -193,52 +363,102 @@ def enrich_schools(
             location = f"{kabupaten}, {provinsi}"
 
             try:
-                logger.info("[%s] Searching: %s (%s)", npsn, name, location)
+                logger.info("[%s] Enriching: %s (%s)", npsn, name, location)
 
-                # Step 1: Google Search
-                search_results = _google_search_school(name, location)
+                # ── Step 1: Collect government data already in DB ─────────
+                govt_data = {
+                    "contact_number": school.get("detail_phone"),
+                    "email": school.get("detail_email"),
+                    "website": school.get("detail_website"),
+                    "instagram": None,
+                    "whatsapp": None,
+                    "facebook": None,
+                }
 
-                # Step 2: Scrape top 2 pages
+                # If the govt phone looks like a mobile, it might be WA
+                phone = school.get("detail_phone") or ""
+                if phone and re.match(r"^(?:\+62|62|0)8\d{8,12}$", re.sub(r"[\s\-]", "", phone)):
+                    govt_data["whatsapp"] = re.sub(r"[\s\-]", "", phone)
+
+                # ── Step 2: Multi-strategy Google search ──────────────────
+                queries = _build_search_queries(name, location, npsn)
+                urls = _google_search_multi(queries, max_results_per_query=3)
+
+                logger.debug("[%s] Found %d URLs from Google", npsn, len(urls))
+
+                # ── Step 3: Analyze URLs themselves ───────────────────────
+                url_data = _extract_from_urls(urls)
+
+                # ── Step 4: Scrape top pages ──────────────────────────────
+                all_html = ""
                 all_text = ""
-                snippets = ""
-                for result in search_results[:2]:
-                    url = result["url"]
-                    page_text = _scrape_page(url)
-                    all_text += f"\n--- {url} ---\n{page_text}\n"
-                    snippets += f"{url}\n"
+                snippets_for_ai = ""
+                pages_scraped = 0
 
-                # Step 3: Quick regex extraction
-                regex_data = _quick_extract_from_text(all_text)
+                for url in urls[:4]:
+                    if any(d in url.lower() for d in ("instagram.com", "facebook.com", "fb.com")):
+                        continue
 
-                # Step 4: DeepSeek extraction
-                deepseek_data = extract_contact_info(
-                    school_name=name,
-                    location=location,
-                    search_snippets=snippets,
-                    page_content=all_text,
-                )
+                    raw_html, text = _scrape_page(url)
+                    if raw_html:
+                        all_html += f"\n<!-- {url} -->\n{raw_html}\n"
+                        all_text += f"\n--- {url} ---\n{text}\n"
+                        snippets_for_ai += f"{url}\n"
+                        pages_scraped += 1
 
-                # Step 5: Merge results
-                final_data = _merge_results(deepseek_data, regex_data)
+                    if pages_scraped >= 3:
+                        break
+
+                # ── Step 5: Regex extraction from HTML ────────────────────
+                regex_data = _extract_from_html_and_text(all_html, all_text)
+
+                # ── Step 6: DeepSeek AI extraction ────────────────────────
+                deepseek_data = {}
+                if all_text.strip():
+                    try:
+                        deepseek_data = extract_contact_info(
+                            school_name=name,
+                            location=location,
+                            search_snippets=snippets_for_ai,
+                            page_content=all_text,
+                        )
+                    except Exception as e:
+                        logger.debug("[%s] DeepSeek error: %s", npsn, e)
+
+                # ── Step 7: Merge all results ─────────────────────────────
+                final_data = _merge_all_results(govt_data, url_data, regex_data, deepseek_data)
                 final_data["school_name"] = name
                 final_data["location"] = location
 
-                # Step 6: Save to MongoDB
+                # ── Step 8: Save to MongoDB ───────────────────────────────
                 mongo.upsert_enrichment(npsn, final_data)
                 processed += 1
 
-                has_data = any(
-                    final_data.get(k)
-                    for k in ["instagram", "whatsapp", "website", "contact_number"]
-                )
+                # Track stats
+                if final_data.get("instagram"):
+                    found_ig += 1
+                if final_data.get("whatsapp"):
+                    found_wa += 1
+                if final_data.get("facebook"):
+                    found_fb += 1
+                if final_data.get("website"):
+                    found_web += 1
+                if final_data.get("contact_number"):
+                    found_phone += 1
+
+                has_data = any(final_data.get(k) for k in [
+                    "instagram", "whatsapp", "facebook", "website", "contact_number", "email",
+                ])
                 if has_data:
                     logger.info(
-                        "[%s] Found: IG=%s | WA=%s | Web=%s | Phone=%s",
+                        "[%s] IG=%s | WA=%s | FB=%s | Web=%s | Phone=%s | Email=%s",
                         npsn,
                         final_data.get("instagram") or "-",
                         final_data.get("whatsapp") or "-",
+                        final_data.get("facebook") or "-",
                         final_data.get("website") or "-",
                         final_data.get("contact_number") or "-",
+                        final_data.get("email") or "-",
                     )
                 else:
                     logger.info("[%s] No contact info found.", npsn)
@@ -248,23 +468,29 @@ def enrich_schools(
                     "last_npsn": npsn,
                     "processed": processed,
                     "errors": errors,
+                    "found_ig": found_ig,
+                    "found_wa": found_wa,
+                    "found_fb": found_fb,
+                    "found_web": found_web,
+                    "found_phone": found_phone,
                 })
 
             except Exception as e:
                 errors += 1
                 logger.error("[%s] Error enriching %s: %s", npsn, name, e)
-                # Save a placeholder so we don't retry endlessly
                 mongo.upsert_enrichment(npsn, {
                     "school_name": name,
                     "location": location,
                     "instagram": None,
                     "whatsapp": None,
+                    "facebook": None,
                     "website": None,
                     "contact_number": None,
+                    "email": None,
                     "error": str(e),
                 })
 
-            # Delay between searches to avoid rate limiting
+            # Delay between schools
             jitter = random.uniform(0.5, 1.5)
             time.sleep(delay + jitter)
 
@@ -272,7 +498,10 @@ def enrich_schools(
     total_enriched = mongo.get_enriched_count()
     logger.info("=" * 60)
     logger.info("Enrichment complete!")
-    logger.info("Total processed: %d", processed)
-    logger.info("Total errors: %d", errors)
+    logger.info("Processed: %d | Errors: %d", processed, errors)
+    logger.info(
+        "IG: %d | WA: %d | FB: %d | Web: %d | Phone: %d",
+        found_ig, found_wa, found_fb, found_web, found_phone,
+    )
     logger.info("Total enriched in DB: %d", total_enriched)
     logger.info("=" * 60)

@@ -34,8 +34,10 @@ SYSTEM_PROMPT = """You are a data extraction assistant. Your task is to extract 
 Extract the following fields:
 - instagram: Instagram handle or URL (e.g., @schoolname or https://instagram.com/schoolname)
 - whatsapp: WhatsApp number or wa.me link (Indonesian format, e.g., +62812xxxx or https://wa.me/62812xxxx)
+- facebook: Facebook page name or URL (e.g., https://facebook.com/schoolname)
 - website: Official school website URL (NOT social media links, NOT google maps)
 - contact_number: Phone/telephone number (landline or mobile, Indonesian format)
+- email: Email address of the school
 
 Rules:
 1. Only extract information that is CLEARLY related to the school being queried.
@@ -45,13 +47,17 @@ Rules:
 5. Instagram should be the handle (e.g., @school_name) or full URL.
 6. WhatsApp should be the number or wa.me link.
 7. Website should be a full URL (https://...).
+8. Look carefully in the text for social media links, they are often in footer or sidebar sections.
+9. Indonesian schools often list WhatsApp with "WA", "Hubungi", or "Kontak" markers.
 
 Response format (JSON only):
 {
     "instagram": "value or null",
     "whatsapp": "value or null",
+    "facebook": "value or null",
     "website": "value or null",
-    "contact_number": "value or null"
+    "contact_number": "value or null",
+    "email": "value or null"
 }"""
 
 
@@ -122,8 +128,10 @@ def _parse_response(raw_text: str) -> dict:
     default = {
         "instagram": None,
         "whatsapp": None,
+        "facebook": None,
         "website": None,
         "contact_number": None,
+        "email": None,
     }
 
     # Strip markdown code fences if present

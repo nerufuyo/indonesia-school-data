@@ -44,6 +44,22 @@ def cmd_scrape_schools(args):
     )
 
 
+def cmd_fetch_details(args):
+    """Phase 1.5: Fetch full details from Kemendikdasmen detail API."""
+    from scraper.kemendikdasmen_detail import fetch_school_details
+
+    filters = {}
+    if args.province:
+        filters["namaProvinsi"] = {"$regex": PROVINCES.get(args.province, ""), "$options": "i"}
+
+    fetch_school_details(
+        filters=filters,
+        batch_size=args.batch_size,
+        delay=args.delay,
+        resume=not args.no_resume,
+    )
+
+
 def cmd_enrich(args):
     """Phase 2: Enrich schools with Google + DeepSeek data."""
     from scraper.google_enricher import enrich_schools
@@ -108,6 +124,7 @@ def cmd_status(args):
     print("  INDONESIA SCHOOL DATA SCRAPER — STATUS")
     print("=" * 55)
     print(f"  Schools in DB:     {summary['total_schools']:>10,}")
+    print(f"  With details:      {summary['total_with_details']:>10,}")
     print(f"  Enriched:          {summary['total_enriched']:>10,}")
     remaining = summary["total_schools"] - summary["total_enriched"]
     print(f"  Remaining:         {remaining:>10,}")
@@ -155,12 +172,19 @@ def cmd_reset(args):
     if args.task == "scrape":
         mongo.clear_progress("kemendikdasmen_scrape")
         logger.info("Phase 1 progress reset.")
+    elif args.task == "details":
+        mongo.clear_progress("kemendikdasmen_detail")
+        # Also clear the detail_fetched flag so they get re-fetched
+        mongo.db["schools"].update_many({}, {"$unset": {"detail_fetched": ""}})
+        logger.info("Phase 1.5 progress reset (detail_fetched flags cleared).")
     elif args.task == "enrich":
         mongo.clear_progress("google_enrich")
         logger.info("Phase 2 progress reset.")
     elif args.task == "all":
         mongo.clear_progress("kemendikdasmen_scrape")
+        mongo.clear_progress("kemendikdasmen_detail")
         mongo.clear_progress("google_enrich")
+        mongo.db["schools"].update_many({}, {"$unset": {"detail_fetched": ""}})
         logger.info("All progress reset.")
 
 
@@ -172,8 +196,8 @@ def main():
 Examples:
   python main.py scrape-schools                           # Scrape all schools
   python main.py scrape-schools --province 010000         # Scrape DKI Jakarta only
-  python main.py scrape-schools --edu-type sd             # Scrape SD schools only
-  python main.py enrich --batch-size 10 --delay 5         # Enrich with custom settings
+  python main.py fetch-details --province 010000          # Fetch phone/email/principal
+  python main.py enrich --batch-size 10 --delay 5         # Enrich with social media
   python main.py export --province 010000 --output out.xlsx
   python main.py status                                   # Check progress
   python main.py list-provinces                           # Show province codes
@@ -192,6 +216,14 @@ Examples:
     p_scrape.add_argument("--batch-size", type=int, default=BATCH_SIZE, help=f"Records per page (default: {BATCH_SIZE})")
     p_scrape.add_argument("--no-resume", action="store_true", help="Start from beginning, ignore saved progress")
     p_scrape.set_defaults(func=cmd_scrape_schools)
+
+    # ── fetch-details ─────────────────────────────────────────────────────
+    p_detail = subparsers.add_parser("fetch-details", help="Phase 1.5: Fetch full school details (phone, email, principal, etc.)")
+    p_detail.add_argument("--province", type=str, help="Filter by province code")
+    p_detail.add_argument("--batch-size", type=int, default=200, help="Schools per batch (default: 200)")
+    p_detail.add_argument("--delay", type=float, default=0.3, help="Seconds between API calls (default: 0.3)")
+    p_detail.add_argument("--no-resume", action="store_true", help="Re-fetch all details")
+    p_detail.set_defaults(func=cmd_fetch_details)
 
     # ── enrich ────────────────────────────────────────────────────────────
     p_enrich = subparsers.add_parser("enrich", help="Phase 2: Enrich via Google + DeepSeek")
@@ -222,7 +254,7 @@ Examples:
 
     # ── reset ─────────────────────────────────────────────────────────────
     p_reset = subparsers.add_parser("reset", help="Reset progress tracking")
-    p_reset.add_argument("--task", type=str, choices=["scrape", "enrich", "all"], default="all", help="Which task to reset")
+    p_reset.add_argument("--task", type=str, choices=["scrape", "details", "enrich", "all"], default="all", help="Which task to reset")
     p_reset.set_defaults(func=cmd_reset)
 
     args = parser.parse_args()
