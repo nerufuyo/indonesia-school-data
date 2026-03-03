@@ -187,6 +187,7 @@ class MongoDB:
                 "facebook": "$enrichment.facebook",
                 "website_social": "$enrichment.website",
                 "contact_social": "$enrichment.contact_number",
+                "email": "$enrichment.email",
             }},
             {"$project": {"enrichment": 0, "_id": 0}},
         ])

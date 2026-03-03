@@ -101,7 +101,7 @@ def _style_header(ws):
     ws.freeze_panes = "A2"
 
 
-def _write_rows(ws, schools: list[dict], start_num: int = 1):
+def _write_rows(ws, schools: list[dict], start_num: int = 1, start_row: int = 2):
     """Write school data rows to the worksheet."""
     data_alignment = Alignment(vertical="top", wrap_text=True)
     thin_border = Border(
@@ -111,11 +111,12 @@ def _write_rows(ws, schools: list[dict], start_num: int = 1):
         bottom=Side(style="thin"),
     )
 
-    for row_idx, school in enumerate(schools, 2):
+    for i, school in enumerate(schools):
+        row_idx = start_row + i
         for col_idx, (_, field, _) in enumerate(COLUMNS, 1):
             if field is None:
                 # Row number
-                value = start_num + row_idx - 2
+                value = start_num + i
             else:
                 value = school.get(field, "") or ""
 
@@ -186,6 +187,7 @@ def _export_single(output_path: str, filters: dict, total: int) -> str:
     batch_size = 5000
     offset = 0
     row_num = 1
+    excel_row = 2  # row 1 is the header
 
     while offset < total:
         schools = mongo.get_schools_with_enrichment(
@@ -197,8 +199,9 @@ def _export_single(output_path: str, filters: dict, total: int) -> str:
         if not schools:
             break
 
-        _write_rows(ws, schools, start_num=row_num)
+        _write_rows(ws, schools, start_num=row_num, start_row=excel_row)
         row_num += len(schools)
+        excel_row += len(schools)
         offset += len(schools)
         logger.info("Written %d/%d rows...", offset, total)
 
@@ -235,6 +238,8 @@ def _export_chunked(base_path: str, filters: dict, total: int) -> list[str]:
         chunk_written = 0
         row_num = offset + 1
 
+        excel_row = 2  # row 1 is the header
+
         while chunk_written < MAX_ROWS_PER_FILE and (offset + chunk_written) < total:
             batch_size = min(5000, MAX_ROWS_PER_FILE - chunk_written)
             schools = mongo.get_schools_with_enrichment(
@@ -246,8 +251,9 @@ def _export_chunked(base_path: str, filters: dict, total: int) -> list[str]:
             if not schools:
                 break
 
-            _write_rows(ws, schools, start_num=row_num)
+            _write_rows(ws, schools, start_num=row_num, start_row=excel_row)
             row_num += len(schools)
+            excel_row += len(schools)
             chunk_written += len(schools)
 
         wb.save(chunk_path)
